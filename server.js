@@ -35,12 +35,37 @@ app.post("/webhook", async (req, res) => {
   for (const event of events) {
     if (event.type === "postback") {
       const data = event.postback.data;
+      const params = new URLSearchParams(data);
+
+      if (params.get("action") === "select") {
+        const type = params.get("type");
+        const userId = event.source.userId;
+
+        console.log("使用者選擇收支", type);
+
+        tempStore[userId] = {
+          mode: "ledger",
+          type: type,
+          step: "waitingItems",
+        };
+
+        await replyText(
+          event.replyToken,
+          type === "expense"
+            ? "請輸入支出項目與金額，例如：\n早餐 80\n咖啡 120"
+            : "請輸入收入項目與金額，例如：\n薪水 30000\n獎金 5000",
+        );
+
+        console.log(tempStore[userId]);
+        return;
+      }
 
       if (data === "action=confirm") {
         const userId = event.source.userId;
         const dataToSave = tempStore[userId];
+        const itemsToSave = dataToSave ? dataToSave.items : null;
 
-        if (!dataToSave) {
+        if (!itemsToSave || itemsToSave.length === 0) {
           console.log("沒有找到暫存資料");
           await replyText(
             event.replyToken,
@@ -50,8 +75,8 @@ app.post("/webhook", async (req, res) => {
         }
 
         try {
-          for (const item of dataToSave) {
-            const [name, amount] = item.replace("元", "").trim().split(/\s+/);
+          for (const item of itemsToSave) {
+            const [name, amount, currency] = item.split("|");
 
             await notion.pages.create({
               parent: {
@@ -77,17 +102,23 @@ app.post("/webhook", async (req, res) => {
                 },
                 收支: {
                   select: {
-                    name: "支出",
+                    name: dataToSave.type === "expense" ? "支出" : "收入",
+                  },
+                },
+                幣值: {
+                  select: {
+                    name: currency,
                   },
                 },
               },
             });
           }
           delete tempStore[userId];
-          await replyText(
-            event.replyToken,
-            `已記帳：\n${dataToSave.join("\n")}`,
-          );
+          const display = itemsToSave.map((m) => {
+            const [name, amount, currency] = m.split("|");
+            return `${name} ${amount} ${currency}`;
+          });
+          await replyText(event.replyToken, `已記帳：\n${display.join("\n")}`);
         } catch (error) {
           console.error("❌ Notion 記帳失敗:", error.message);
           await replyText(event.replyToken, "Notion 記帳失敗");
@@ -113,27 +144,44 @@ app.post("/webhook", async (req, res) => {
 
 // 處理功能指令
 async function handleCommand(event) {
+  const userId = event.source.userId;
+  const userState = tempStore[userId];
   const text = event.message.text;
   const lines = text.split("\n");
   const command = lines[0].trim();
 
-  if (command === "記帳") {
-    const result = handleExpense(lines);
+  if (userState && userState.step === "waitingItems") {
+    const result = handleExpense(["記帳", ...lines]);
 
     if (!result || result.length === 0) {
-      await replyText(event.replyToken, "沒有找到可記帳的內容，請重新輸入><");
+      await replyText(event.replyToken, "請重新輸入記帳內容");
       return;
     }
 
-    const userId = event.source.userId;
-    tempStore[userId] = result;
+    tempStore[userId] = {
+      mode: "ledger",
+      type: userState.type,
+      step: "confirming",
+      items: result,
+    };
+
+    console.log("解析結果:", result);
 
     await replyConfirm(event.replyToken, result);
     return;
   }
-  console.log("未知指令", command);
-  await replyText(event.replyToken, "目前僅支援記帳！");
+
+  if (command === "記帳") {
+    console.log("使用者要記帳");
+    await replyTypeSelect(event.replyToken);
+    return;
+  }
+
+  console.log("未知指令:", command);
+  await replyText(event.replyToken, "目前支援的指令：記帳");
 }
+
+// 處理收入支出
 
 // 處理記帳
 function handleExpense(lines) {
@@ -143,17 +191,18 @@ function handleExpense(lines) {
 
     if (index === 0 || !cleanLine) continue;
 
-    const match = cleanLine.match(/^(.+?)(?::|\s+)?(\d+)$/);
+    const match = cleanLine.match(/^(.+?)\s*(\d+)\s*(澳|AUD|日|JPY)?$/);
 
     if (match) {
       const item = match[1].trim();
       const amount = Number(match[2]);
+      const currencyRaw = match[3];
 
-      console.log("・記帳項目");
-      console.log("・項目：", item);
-      console.log("・金額：", amount);
+      let currency = "台幣";
+      if (currencyRaw === "澳" || currencyRaw === "AUD") currency = "澳幣";
+      if (currencyRaw === "日" || currencyRaw === "JPY") currency = "日幣";
 
-      message.push(`${item} ${amount} 元`);
+      message.push(`${item}|${amount}|${currency}`);
     } else {
       console.log("❌ 無法解析:", cleanLine);
     }
@@ -161,11 +210,60 @@ function handleExpense(lines) {
   return message;
 }
 
+// LINE BOT 收入支出選項
+async function replyTypeSelect(replyToken) {
+  try {
+    await axios.post(
+      "https://api.line.me/v2/bot/message/reply",
+      {
+        replyToken,
+        messages: [
+          {
+            type: "template",
+            altText: "請選擇收入或支出",
+            template: {
+              type: "buttons",
+              text: "請選擇收入或支出",
+              actions: [
+                {
+                  type: "postback",
+                  label: "收入",
+                  data: "action=select&type=income",
+                },
+                {
+                  type: "postback",
+                  label: "支出",
+                  data: "action=select&type=expense",
+                },
+              ],
+            },
+          },
+        ],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+        },
+      },
+    );
+  } catch (error) {
+    console.error(
+      "LINE收入支出選項失敗：",
+      error.response?.data || error.message,
+    );
+  }
+}
+
 // LINE BOT 確認回覆
 async function replyConfirm(replyToken, message) {
   if (!message || message.length === 0) return;
 
-  const text = `要記帳嗎？ \n${message.join("\n")}`;
+  const display = message.map((m) => {
+    const [name, amount, currency] = m.split("|");
+    return `${name} ${amount} ${currency}`;
+  });
+  const text = `要記帳嗎？ \n${display.join("\n")}`;
 
   try {
     await axios.post(
